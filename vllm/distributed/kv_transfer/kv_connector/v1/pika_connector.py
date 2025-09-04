@@ -3,13 +3,16 @@
 
 import hashlib
 import pickle
+import struct
 import zlib
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, List, Dict, Tuple
 
 import torch
 import redis
+import asyncio
+import concurrent.futures
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -27,19 +30,40 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass 
+class KVPageInfo:
+    """KV Page 信息，对应 vLLM 的 PagedAttention"""
+    req_id: str
+    layer_idx: int
+    head_idx: int  
+    page_id: int
+    kv_type: int  # 0=K, 1=V
+    page_size: int  # tokens per page (e.g. 128)
+    head_dim: int
+    dtype: int  # 1=FP16, 2=FP32
+    
+    def build_key(self) -> str:
+        """构建 PikiwiDB 存储键"""
+        return f"kv:{self.req_id}:{self.layer_idx}:{self.head_idx}:{self.page_id}:{self.kv_type}"
+
 @dataclass
 class PikaReqMeta:
-    """请求元数据，包含缓存相关信息"""
+    """请求元数据，包含缓存相关信息 - 适配 PagedAttention (去重优化版本)"""
     request_id: str
     token_ids: torch.Tensor
     slot_mapping: torch.Tensor
     is_store: bool
     mm_hashes: list[str]
     cache_key_prefix: str
+    # Page-oriented fields (去重优化)
+    slot_to_page_mapping: Dict[int, Tuple[int, int, int]]  # slot_idx -> (page_id, head_idx, token_offset)
+    unique_pages: Dict[Tuple[int, int, int], KVPageInfo]  # (page_id, head_idx, kv_type) -> page_info
+    page_size: int  # 页大小，通常是 128 tokens
 
     @staticmethod
     def make_meta(request_id: str, token_ids: list[int], block_ids: list[int], 
-                  block_size: int, is_store: bool, mm_hashes: list[str]) -> "PikaReqMeta":
+                  block_size: int, is_store: bool, mm_hashes: list[str],
+                  page_size: int = 128, head_dim: int = 128, num_heads: int = 32) -> "PikaReqMeta":
         valid_num_tokens = align_to_block_size(len(token_ids), block_size)
         token_ids_tensor = torch.tensor(token_ids)[:valid_num_tokens]
         block_ids_tensor = torch.tensor(block_ids)
@@ -52,6 +76,34 @@ class PikaReqMeta:
         # 生成缓存键前缀
         cache_key_prefix = _generate_cache_key_prefix(token_ids_tensor, mm_hashes)
         
+        # 构建去重的 Page 映射
+        slot_to_page_mapping = {}
+        unique_pages = {}
+        
+        for slot_idx, slot_id in enumerate(slot_mapping.tolist()):
+            page_id = slot_id // page_size  # 计算页ID
+            token_offset = slot_id % page_size  # 页内偏移
+            
+            # 每个 slot 对应一个页面位置 (保留完整的 head 信息以备将来使用)
+            # 这里暂时用 head_idx=0，但保持结构完整性
+            slot_to_page_mapping[slot_idx] = (page_id, 0, token_offset)
+            
+            # 为每个唯一的 (page_id, head_idx, kv_type) 创建一个 KVPageInfo
+            for head_idx in range(num_heads):
+                for kv_type in [0, 1]:  # K=0, V=1
+                    page_key = (page_id, head_idx, kv_type)
+                    if page_key not in unique_pages:
+                        unique_pages[page_key] = KVPageInfo(
+                            req_id=request_id,
+                            layer_idx=0,  # 将在实际使用时设置
+                            head_idx=head_idx,
+                            page_id=page_id,
+                            kv_type=kv_type,
+                            page_size=page_size,
+                            head_dim=head_dim,
+                            dtype=1  # FP16
+                        )
+        
         return PikaReqMeta(
             request_id=request_id,
             token_ids=token_ids_tensor,
@@ -59,6 +111,9 @@ class PikaReqMeta:
             is_store=is_store,
             mm_hashes=mm_hashes,
             cache_key_prefix=cache_key_prefix,
+            slot_to_page_mapping=slot_to_page_mapping,
+            unique_pages=unique_pages,
+            page_size=page_size,
         )
 
 
@@ -116,141 +171,237 @@ class PikaConnector(KVConnectorBase_V1):
             logger.warning(f"无法连接到PikiwiDB: {e}, 将使用本地缓存模式")
             self._redis_client = None
         
-        # 初始化多级缓存
-        self._gpu_cache: OrderedDict[str, torch.Tensor] = OrderedDict()  # GPU缓存
-        self._cpu_cache: OrderedDict[str, torch.Tensor] = OrderedDict()  # CPU缓存
+        # 页面缓存已经通过 PikiwiDB 直接管理，不需要额外的本地缓存
         
         logger.info(f"PikaConnector初始化完成 - "
-                   f"CPU缓存大小: {self._cpu_cache_size}, "
-                   f"GPU缓存大小: {self._gpu_cache_size}, "
-                   f"TTL: {self._pikiwidb_ttl}s")
+                   f"页面大小: 128 tokens, "
+                   f"TTL: {self._pikiwidb_ttl}s, "
+                   f"存储策略: {self._storage_policy}")
 
     def _generate_cache_key(self, layer_name: str, cache_key_prefix: str) -> str:
-        """生成缓存键"""
+        """生成缓存键（Legacy 方法）"""
         return f"vllm:kv:{cache_key_prefix}:{layer_name}"
-
-    def _serialize_kv_cache(self, kv_cache: torch.Tensor) -> bytes:
-        """序列化KV缓存数据"""
+    
+    def _serialize_kv_page(self, kv_page: torch.Tensor, dtype: int = 1) -> bytes:
+        """序列化单个 KV 页面为二进制数据 (优化版本)
+        
+        Args:
+            kv_page: [page_size, head_dim] 的 tensor
+            dtype: 数据类型 (1=FP16, 2=FP32)
+        
+        Returns:
+            序列化的页面数据（不包含 header，header 由 PikiwiDB 处理）
+        """
         try:
-            # 移到CPU并序列化
-            cpu_tensor = kv_cache.detach().cpu()
-            serialized = pickle.dumps(cpu_tensor)
-            # 压缩数据
-            compressed = zlib.compress(serialized, level=6)
-            return compressed
+            # 确保 tensor 连续且在 CPU 上，避免隐式拷贝
+            cpu_tensor = kv_page.detach().cpu().contiguous()
+            
+            # 根据 dtype 转换数据类型
+            if dtype == 1:  # FP16
+                cpu_tensor = cpu_tensor.to(torch.float16)
+            elif dtype == 2:  # FP32
+                cpu_tensor = cpu_tensor.to(torch.float32)
+            
+            # 确保连续性后再转换为 numpy（零拷贝）
+            if not cpu_tensor.is_contiguous():
+                cpu_tensor = cpu_tensor.contiguous()
+            
+            return cpu_tensor.numpy().tobytes()
+            
         except Exception as e:
-            logger.error(f"序列化KV缓存失败: {e}")
+            logger.error(f"序列化KV页面失败: {e}")
             raise
-
-    def _deserialize_kv_cache(self, data: bytes, device: torch.device) -> torch.Tensor:
-        """反序列化KV缓存数据"""
+    
+    def _deserialize_kv_page(self, data: bytes, page_size: int, head_dim: int, 
+                           dtype: int, device: torch.device, use_async: bool = True) -> torch.Tensor:
+        """反序列化KV页面数据 (优化版本，支持异步传输)
+        
+        Args:
+            data: 序列化的页面数据
+            page_size: 页面大小（token数）
+            head_dim: 头维度
+            dtype: 数据类型 (1=FP16, 2=FP32)
+            device: 目标设备
+            use_async: 是否使用异步传输到 GPU
+        
+        Returns:
+            [page_size, head_dim] 的 tensor
+        """
         try:
-            # 解压缩
-            decompressed = zlib.decompress(data)
-            # 反序列化
-            tensor = pickle.loads(decompressed)
-            # 移到指定设备
-            return tensor.to(device)
+            import numpy as np
+            
+            # 根据 dtype 确定 numpy 数据类型
+            if dtype == 1:  # FP16
+                np_dtype = np.float16
+                torch_dtype = torch.float16
+            elif dtype == 2:  # FP32
+                np_dtype = np.float32
+                torch_dtype = torch.float32
+            else:
+                raise ValueError(f"Unsupported dtype: {dtype}")
+            
+            # 从 raw bytes 重建 numpy array (创建可写的连续数组)
+            np_array = np.frombuffer(data, dtype=np_dtype).reshape(page_size, head_dim).copy()
+            
+            # 转换为 torch tensor
+            host_tensor = torch.from_numpy(np_array)
+            
+            # 优化的设备传输
+            if device.type == 'cuda' and use_async:
+                # 使用 pinned memory 和异步传输
+                try:
+                    pinned_tensor = host_tensor.pin_memory()
+                    cuda_tensor = pinned_tensor.to(device, non_blocking=True)
+                    return cuda_tensor
+                except Exception as e:
+                    logger.warning(f"异步传输失败，回退到同步传输: {e}")
+                    return host_tensor.to(device)
+            else:
+                # 同步传输
+                return host_tensor.to(device)
+            
         except Exception as e:
-            logger.error(f"反序列化KV缓存失败: {e}")
+            logger.error(f"反序列化KV页面失败: {e}")
             raise
+    
+    def _batch_store_pages(self, page_infos: List[KVPageInfo], 
+                          tensors: List[torch.Tensor]) -> bool:
+        """批量存储多个页面到 PikiwiDB
+        
+        Args:
+            page_infos: 页面信息列表
+            tensors: 对应的 tensor 列表
+        
+        Returns:
+            是否全部存储成功
+        """
+        if not self._redis_client or len(page_infos) != len(tensors):
+            return False
+        
+        try:
+            # 构建 KVPAGEMSET 命令参数
+            cmd_args = ["KVPAGEMSET", str(len(page_infos))]
+            
+            for page_info, tensor in zip(page_infos, tensors):
+                # 序列化 tensor 数据
+                tensor_data = self._serialize_kv_page(tensor, page_info.dtype)
+                
+                # 添加页面参数
+                cmd_args.extend([
+                    page_info.req_id,
+                    str(page_info.layer_idx),
+                    str(page_info.head_idx),
+                    str(page_info.page_id),
+                    str(page_info.kv_type),
+                    str(page_info.dtype),
+                    str(page_info.page_size),
+                    str(page_info.head_dim),
+                    str(self._pikiwidb_ttl),  # TTL
+                    tensor_data
+                ])
+            
+            # 执行批量存储
+            result = self._redis_client.execute_command(*cmd_args)
+            success = (result == b'OK')
+            
+            if success:
+                logger.debug(f"批量存储 {len(page_infos)} 个页面成功")
+            else:
+                logger.warning(f"批量存储页面失败: {result}")
+                
+            return success
+            
+        except Exception as e:
+            logger.error(f"批量存储页面异常: {e}")
+            return False
+    
+    def _batch_load_pages(self, page_infos: List[KVPageInfo], 
+                         device: torch.device) -> List[Optional[torch.Tensor]]:
+        """批量加载多个页面从 PikiwiDB
+        
+        Args:
+            page_infos: 页面信息列表
+            device: 目标设备
+        
+        Returns:
+            加载的 tensor 列表（None 表示页面不存在）
+        """
+        if not self._redis_client:
+            return [None] * len(page_infos)
+        
+        try:
+            # 构建 KVPAGEMGET 命令参数
+            cmd_args = ["KVPAGEMGET", str(len(page_infos))]
+            
+            for page_info in page_infos:
+                cmd_args.extend([
+                    page_info.req_id,
+                    str(page_info.layer_idx),
+                    str(page_info.head_idx),
+                    str(page_info.page_id),
+                    str(page_info.kv_type)
+                ])
+            
+            # 执行批量加载
+            results = self._redis_client.execute_command(*cmd_args)
+            
+            if not isinstance(results, list):
+                logger.warning(f"批量加载返回格式异常: {type(results)}")
+                return [None] * len(page_infos)
+            
+            # 解析结果
+            tensors = []
+            for i, (page_info, result) in enumerate(zip(page_infos, results)):
+                if result is None or (isinstance(result, bytes) and len(result) == 0):
+                    tensors.append(None)
+                    continue
+                
+                try:
+                    # 反序列化页面数据
+                    tensor = self._deserialize_kv_page(
+                        result, page_info.page_size, page_info.head_dim, 
+                        page_info.dtype, device)
+                    tensors.append(tensor)
+                except Exception as e:
+                    logger.warning(f"反序列化第 {i} 个页面失败: {e}")
+                    tensors.append(None)
+            
+            logger.debug(f"批量加载 {len(page_infos)} 个页面，成功 {sum(1 for t in tensors if t is not None)} 个")
+            return tensors
+            
+        except Exception as e:
+            logger.error(f"批量加载页面异常: {e}")
+            return [None] * len(page_infos)
 
-    def _get_kv_cache(self, cache_key: str, device: torch.device) -> Optional[torch.Tensor]:
-        """从三级存储中获取KV缓存"""
-        # 1. 先查GPU缓存
-        if cache_key in self._gpu_cache:
-            kv_cache = self._gpu_cache[cache_key]
-            # 更新LRU顺序
-            self._gpu_cache.move_to_end(cache_key)
-            logger.debug(f"GPU缓存命中: {cache_key}")
-            return kv_cache.to(device)
-        
-        # 2. 查CPU缓存
-        if cache_key in self._cpu_cache:
-            kv_cache = self._cpu_cache[cache_key]
-            # 更新LRU顺序
-            self._cpu_cache.move_to_end(cache_key)
-            # 提升到GPU缓存
-            self._set_gpu_cache(cache_key, kv_cache.to(device))
-            logger.debug(f"CPU缓存命中: {cache_key}")
-            return kv_cache.to(device)
-        
-        # 3. 查PikiwiDB
-        if self._redis_client:
-            try:
-                data = self._redis_client.get(cache_key)
-                if data:
-                    kv_cache = self._deserialize_kv_cache(data, device)
-                    # 提升到CPU和GPU缓存
-                    self._set_cpu_cache(cache_key, kv_cache.cpu())
-                    self._set_gpu_cache(cache_key, kv_cache)
-                    logger.debug(f"PikiwiDB缓存命中: {cache_key}")
-                    return kv_cache
-            except Exception as e:
-                logger.warning(f"从PikiwiDB获取缓存失败: {e}")
-        
-        return None
 
-    def _set_gpu_cache(self, cache_key: str, kv_cache: torch.Tensor):
-        """设置GPU缓存"""
-        # 如果缓存满了，删除最旧的条目
-        while len(self._gpu_cache) >= self._gpu_cache_size:
-            oldest_key = next(iter(self._gpu_cache))
-            del self._gpu_cache[oldest_key]
-        
-        self._gpu_cache[cache_key] = kv_cache.detach()
-
-    def _set_cpu_cache(self, cache_key: str, kv_cache: torch.Tensor):
-        """设置CPU缓存"""
-        # 如果缓存满了，删除最旧的条目
-        while len(self._cpu_cache) >= self._cpu_cache_size:
-            oldest_key = next(iter(self._cpu_cache))
-            del self._cpu_cache[oldest_key]
-        
-        self._cpu_cache[cache_key] = kv_cache.detach()
-
-    def _set_kv_cache(self, cache_key: str, kv_cache: torch.Tensor, ttl_seconds: int):
-        """保存KV缓存到三级存储"""
-        # 1. 保存到GPU缓存
-        self._set_gpu_cache(cache_key, kv_cache)
-        
-        # 2. 保存到CPU缓存
-        self._set_cpu_cache(cache_key, kv_cache.cpu())
-        
-        # 3. 异步保存到PikiwiDB
-        if self._redis_client:
-            try:
-                serialized_data = self._serialize_kv_cache(kv_cache)
-                self._redis_client.setex(cache_key, ttl_seconds, serialized_data)
-                logger.debug(f"KV缓存已保存到PikiwiDB: {cache_key}")
-            except Exception as e:
-                logger.warning(f"保存到PikiwiDB失败: {e}")
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
-        """开始加载KV缓存"""
+        """开始加载KV缓存 - Page 粒度去重优化版本"""
         attn_metadata = forward_context.attn_metadata
         
-        def inject_kv_into_layer(
+        def place_page_into_kv_cache(
             dst_kv_cache_layer: torch.Tensor,
-            src_kv_cache: torch.Tensor,
-            slot_mapping: torch.Tensor,
+            page_tensor: torch.Tensor,
+            page_info: KVPageInfo,
         ) -> None:
-            """将KV缓存注入到层中"""
-            dst_kv_cache_layer_shape = dst_kv_cache_layer.shape
-            if isinstance(attn_metadata, MLACommonMetadata):
-                num_pages = dst_kv_cache_layer_shape[0]
-                page_size = dst_kv_cache_layer_shape[1]
-                dst_kv_cache_layer = dst_kv_cache_layer.reshape(
-                    num_pages * page_size, -1)
-                dst_kv_cache_layer[slot_mapping, ...] = src_kv_cache
-                dst_kv_cache_layer.reshape(dst_kv_cache_layer_shape)
-            else:
-                num_pages = dst_kv_cache_layer_shape[1]
-                page_size = dst_kv_cache_layer_shape[2]
-                dst_kv_cache_layer = dst_kv_cache_layer.reshape(
-                    2, num_pages * page_size, -1)
-                dst_kv_cache_layer[:, slot_mapping, ...] = src_kv_cache
-                dst_kv_cache_layer.reshape(dst_kv_cache_layer_shape)
+            """将单个页面放入 KV cache 的正确位置 (通用适配器)"""
+            dst_shape = dst_kv_cache_layer.shape
+            
+            try:
+                if isinstance(attn_metadata, MLACommonMetadata):
+                    # MLA 格式: [num_pages, page_size, num_heads, head_dim]
+                    if len(dst_shape) >= 4 and page_info.page_id < dst_shape[0]:
+                        dst_kv_cache_layer[page_info.page_id, :, page_info.head_idx, :] = page_tensor
+                else:
+                    # 标准格式: [2, num_pages, page_size, num_heads, head_dim] 或其变种
+                    if len(dst_shape) >= 5 and page_info.page_id < dst_shape[1]:
+                        dst_kv_cache_layer[page_info.kv_type, page_info.page_id, :, page_info.head_idx, :] = page_tensor
+                    elif len(dst_shape) >= 4:
+                        # 备用格式: [num_pages, page_size, num_heads, head_dim]
+                        if page_info.page_id < dst_shape[0]:
+                            dst_kv_cache_layer[page_info.page_id, :, page_info.head_idx, :] = page_tensor
+            except Exception as e:
+                logger.warning(f"页面注入失败 {page_info.page_id}:{page_info.head_idx}:{page_info.kv_type} - {e}")
 
         # 获取元数据
         metadata = self._get_connector_metadata()
@@ -264,14 +415,14 @@ class PikaConnector(KVConnectorBase_V1):
             logger.warning("attention metadata为空，跳过KV加载")
             return
 
-        # 为每个请求的每个层加载KV
+        # 为每个请求的每个层加载KV页面 (去重优化)
         for request in metadata.requests:
             if request.is_store:
                 continue
                 
-            logger.info(f"开始注入KV缓存，token数量: {len(request.slot_mapping)}")
+            logger.info(f"开始注入KV页面缓存，唯一页面数: {len(request.unique_pages)}")
             
-            for layer_name in forward_context.no_compile_layers:
+            for layer_idx, layer_name in enumerate(forward_context.no_compile_layers):
                 layer = forward_context.no_compile_layers[layer_name]
                 
                 # 只处理有kv_cache属性的层（注意力层）
@@ -280,13 +431,36 @@ class PikaConnector(KVConnectorBase_V1):
                     continue
                 
                 kv_cache_layer = kv_cache_attr[forward_context.virtual_engine]
-                cache_key = self._generate_cache_key(layer_name, request.cache_key_prefix)
                 
-                # 从三级存储获取KV缓存
-                kv_cache = self._get_kv_cache(cache_key, kv_cache_layer.device)
-                if kv_cache is not None:
-                    inject_kv_into_layer(kv_cache_layer, kv_cache, request.slot_mapping)
-                    logger.debug(f"成功注入层 {layer_name} 的KV缓存")
+                # 收集这一层需要加载的唯一页面 (去重，避免修改共享对象)
+                layer_unique_pages = []
+                for page_key, page_info in request.unique_pages.items():
+                    # 克隆页面信息并设置正确的层索引
+                    layer_page_info = KVPageInfo(
+                        req_id=page_info.req_id,
+                        layer_idx=layer_idx,  # 设置当前层索引
+                        head_idx=page_info.head_idx,
+                        page_id=page_info.page_id,
+                        kv_type=page_info.kv_type,
+                        page_size=page_info.page_size,
+                        head_dim=page_info.head_dim,
+                        dtype=page_info.dtype
+                    )
+                    layer_unique_pages.append(layer_page_info)
+                
+                if not layer_unique_pages:
+                    continue
+                
+                # 批量加载唯一页面 (避免重复请求)
+                page_tensors = self._batch_load_pages(layer_unique_pages, kv_cache_layer.device)
+                
+                # 将加载的页面注入到层中
+                for page_tensor, page_info in zip(page_tensors, layer_unique_pages):
+                    if page_tensor is not None:
+                        place_page_into_kv_cache(kv_cache_layer, page_tensor, page_info)
+                
+                loaded_count = sum(1 for t in page_tensors if t is not None)
+                logger.debug(f"层 {layer_name} 成功注入 {loaded_count}/{len(layer_unique_pages)} 个唯一KV页面")
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """等待层加载完成（同步实现）"""
@@ -294,30 +468,87 @@ class PikaConnector(KVConnectorBase_V1):
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", **kwargs) -> None:
-        """保存KV缓存层"""
+        """保存KV缓存层 - Page 粒度去重优化版本"""
         
-        def extract_kv_from_layer(
+        def extract_page_from_layer(
             layer: torch.Tensor,
-            slot_mapping: torch.Tensor,
-        ) -> torch.Tensor:
-            """从层中提取KV缓存"""
-            if isinstance(attn_metadata, MLACommonMetadata):
-                num_pages, page_size = layer.shape[0], layer.shape[1]
-                return layer.reshape(num_pages * page_size, -1)[slot_mapping, ...]
-            num_pages, page_size = layer.shape[1], layer.shape[2]
-            return layer.reshape(2, num_pages * page_size, -1)[:, slot_mapping, ...]
+            page_info: KVPageInfo,
+        ) -> Optional[torch.Tensor]:
+            """从层中提取单个KV页面 (通用适配器)"""
+            layer_shape = layer.shape
+            
+            try:
+                if isinstance(attn_metadata, MLACommonMetadata):
+                    # MLA 格式: [num_pages, page_size, num_heads, head_dim]
+                    if len(layer_shape) >= 4 and page_info.page_id < layer_shape[0]:
+                        return layer[page_info.page_id, :, page_info.head_idx, :].clone()
+                else:
+                    # 标准格式: [2, num_pages, page_size, num_heads, head_dim] 或其变种
+                    if len(layer_shape) >= 5 and page_info.page_id < layer_shape[1]:
+                        return layer[page_info.kv_type, page_info.page_id, :, page_info.head_idx, :].clone()
+                    elif len(layer_shape) >= 4:
+                        # 备用格式: [num_pages, page_size, num_heads, head_dim]
+                        if page_info.page_id < layer_shape[0]:
+                            return layer[page_info.page_id, :, page_info.head_idx, :].clone()
+                
+                return None
+            except Exception as e:
+                logger.warning(f"页面提取失败 {page_info.page_id}:{page_info.head_idx}:{page_info.kv_type} - {e}")
+                return None
 
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, PikaConnectorMetadata)
         
+        # 提取层索引 (简化的层名匹配)
+        layer_idx = 0
+        try:
+            import re
+            match = re.search(r'layer[._](\d+)', layer_name.lower())
+            if match:
+                layer_idx = int(match.group(1))
+        except:
+            pass
+        
         for request in connector_metadata.requests:
-            if request.is_store:
-                cache_key = self._generate_cache_key(layer_name, request.cache_key_prefix)
-                kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)
-                
-                # 保存到三级存储
-                self._set_kv_cache(cache_key, kv_cache.detach(), self._pikiwidb_ttl)
-                logger.debug(f"已保存层 {layer_name} 的KV缓存")
+            if not request.is_store:
+                continue
+            
+            # 收集这一层需要存储的唯一页面 (去重，避免修改共享对象)
+            layer_unique_pages = []
+            for page_key, page_info in request.unique_pages.items():
+                # 克隆页面信息并设置正确的层索引
+                layer_page_info = KVPageInfo(
+                    req_id=page_info.req_id,
+                    layer_idx=layer_idx,  # 设置当前层索引
+                    head_idx=page_info.head_idx,
+                    page_id=page_info.page_id,
+                    kv_type=page_info.kv_type,
+                    page_size=page_info.page_size,
+                    head_dim=page_info.head_dim,
+                    dtype=page_info.dtype
+                )
+                layer_unique_pages.append(layer_page_info)
+            
+            if not layer_unique_pages:
+                continue
+            
+            # 从层中提取唯一页面
+            valid_page_infos = []
+            valid_page_tensors = []
+            
+            for page_info in layer_unique_pages:
+                page_tensor = extract_page_from_layer(kv_layer, page_info)
+                if page_tensor is not None:
+                    valid_page_infos.append(page_info)
+                    valid_page_tensors.append(page_tensor)
+            
+            if valid_page_infos:
+                # 批量存储页面
+                success = self._batch_store_pages(valid_page_infos, valid_page_tensors)
+                if success:
+                    logger.debug(f"层 {layer_name} 成功保存 {len(valid_page_infos)} 个唯一KV页面")
+                else:
+                    logger.warning(f"层 {layer_name} 保存KV页面失败")
 
     def wait_for_save(self):
         """等待保存完成（同步实现）"""
@@ -413,30 +644,34 @@ class PikaConnector(KVConnectorBase_V1):
         """请求完成时调用"""
         return False, None
 
-    def _found_match_for_request(self, request: "Request") -> bool:
-        """检查请求是否有缓存命中"""
+    def _found_match_for_request(self, request) -> bool:
+        """检查请求是否有页面缓存命中 (基于 KVPAGEEXISTS 的检测)"""
         num_tokens_to_check = align_to_block_size(
             len(request.prompt_token_ids) - 1, self._block_size)
         
         if num_tokens_to_check <= 0:
             return False
-            
-        token_ids_tensor = torch.tensor(request.prompt_token_ids)[:num_tokens_to_check]
-        cache_key_prefix = _generate_cache_key_prefix(token_ids_tensor, request.mm_hashes)
         
-        # 检查第一个层是否存在缓存（简化实现）
-        test_layer_name = "model.layers.0.self_attn"
-        cache_key = self._generate_cache_key(test_layer_name, cache_key_prefix)
+        # 生成测试用的关键页面参数
+        # 处理不同类型的请求对象 (Request vs NewRequestData)
+        req_id = getattr(request, 'request_id', None) or getattr(request, 'req_id', None)
+        test_page_id = 0  # 检查第一个页面
+        test_layer_idx = 0  # 检查第一层
+        test_head_idx = 0   # 检查第一个头
+        test_kv_type = 0    # 检查 K cache
         
-        # 检查三级存储是否存在
-        if cache_key in self._gpu_cache or cache_key in self._cpu_cache:
-            return True
-            
+        # 检查 PikiwiDB 是否存在关键页面
         if self._redis_client:
             try:
-                return self._redis_client.exists(cache_key) > 0
+                # 使用新的 KVPAGEEXISTS 命令检查页面是否存在
+                result = self._redis_client.execute_command(
+                    'KVPAGEEXISTS',
+                    req_id, test_layer_idx, test_head_idx, test_page_id, test_kv_type
+                )
+                # KVPAGEEXISTS 返回 1 表示存在，0 表示不存在
+                return result == 1
             except Exception as e:
-                logger.warning(f"检查PikiwiDB缓存时出错: {e}")
+                logger.warning(f"检查页面缓存时出错: {e}")
                 
         return False
 
