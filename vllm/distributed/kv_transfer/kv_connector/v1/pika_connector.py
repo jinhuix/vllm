@@ -12,7 +12,7 @@ This is a basic implementation that supports:
 
 import hashlib
 import logging
-logging.getLogger("vllm.distributed.kv_transfer.kv_connector.v1.pika_connector").setLevel(logging.ERROR)
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 import redis
@@ -63,6 +63,10 @@ class PikaConnector(KVConnectorBase_V1):
         self.redis_port = kv_transfer_config.kv_connector_extra_config.get("port", 6379)
         self.redis_db = kv_transfer_config.kv_connector_extra_config.get("db", 0)
         
+        # Performance tuning parameters
+        self.mget_batch_size = kv_transfer_config.kv_connector_extra_config.get("mget_batch_size", 512)
+        self.socket_timeout = kv_transfer_config.kv_connector_extra_config.get("socket_timeout", 5.0)
+        
         # Generate namespace from cache_salt or model config
         self.namespace = self._generate_namespace(vllm_config)
         
@@ -78,12 +82,19 @@ class PikaConnector(KVConnectorBase_V1):
         # Worker-side: registered KV caches
         self.kv_caches: dict[str, torch.Tensor] = {}
         
+        self._pending_load_layers: dict[str, int] = {}  # request_id -> 剩余待加载层数
+        self._finished_recving: set[str] = set()        # 已完成加载的 request_id
+        self._save_map_by_req: dict[str, dict[str, int]] = {}  # request_id -> {hash: physical_block_id}
+
         # Scheduler-side: track blocks to load/save
         if role == KVConnectorRole.SCHEDULER:
             self._blocks_to_load: dict[str, list[tuple[int, list[tuple[int, str]]]]] = {}
             self._blocks_to_save: dict[str, list[tuple[int, list[tuple[int, str]]]]] = {}
         
-        # 静默初始化
+        # Initialize logger
+        self.logger = logging.getLogger(f"{__name__}.{role.name}")
+        self.logger.info(f"PikaConnector initialized: namespace={self.namespace}, "
+                        f"mget_batch_size={self.mget_batch_size}, socket_timeout={self.socket_timeout}s")
 
     def _generate_namespace(self, vllm_config: VllmConfig) -> str:
         """Generate namespace from vLLM config."""
@@ -105,6 +116,8 @@ class PikaConnector(KVConnectorBase_V1):
                 host=self.redis_host,
                 port=self.redis_port,
                 db=self.redis_db,
+                socket_timeout=self.socket_timeout,
+                socket_connect_timeout=self.socket_timeout,
                 decode_responses=False  # Keep binary data as bytes
             )
         return self._redis_client
@@ -120,7 +133,7 @@ class PikaConnector(KVConnectorBase_V1):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register KV caches for worker-side operations."""
         self.kv_caches = kv_caches.copy()
-        pass  # 静默注册
+        self.logger.debug(f"Registered {len(kv_caches)} KV cache layers")
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         """Start loading KV blocks from PikiwiDB using vLLM-native block hashes."""
@@ -134,25 +147,35 @@ class PikaConnector(KVConnectorBase_V1):
         redis_client = self._get_redis_client()
         
         for request_id, layer_block_list in metadata.blocks_to_load.items():
+            # 该 request 需要加载的层总数
+            self._pending_load_layers[request_id] = len(layer_block_list)
             for layer_idx, block_id_hash_list in layer_block_list:
                 # Find the corresponding KV cache layer
                 layer_kv_cache = None
-                matched_layer_name = None
-                
                 for layer_name, kv_cache in self.kv_caches.items():
                     if f"layers.{layer_idx}." in layer_name or f".{layer_idx}." in layer_name:
                         layer_kv_cache = kv_cache
-                        matched_layer_name = layer_name
                         break
                 
                 if layer_kv_cache is None:
+                    # 该层没找到缓存也算“完成一层”，防止永远不归零
+                    self._pending_load_layers[request_id] -= 1
+                    if self._pending_load_layers[request_id] == 0:
+                        self._finished_recving.add(request_id)
+                        del self._pending_load_layers[request_id]
                     continue
                 
+                # 同步（阻塞式）执行本层加载
                 self._load_blocks_for_layer(redis_client, layer_idx, block_id_hash_list, layer_kv_cache, request_id)
+                # 该层完成，递减计数
+                self._pending_load_layers[request_id] -= 1
+                if self._pending_load_layers[request_id] == 0:
+                    self._finished_recving.add(request_id)
+                    del self._pending_load_layers[request_id]
 
     def _load_blocks_for_layer(self, redis_client: redis.Redis, layer_idx: int, 
                               block_id_hash_list: list[tuple[int, str]], kv_cache: torch.Tensor, request_id: str):
-        """Load blocks for a specific layer using vLLM-native block hashes."""
+        """Load blocks for a specific layer using MGET batching for better performance."""
         kv_shape = kv_cache.shape
         
         # Validate KV cache shape and determine layout
@@ -167,60 +190,134 @@ class PikaConnector(KVConnectorBase_V1):
         else:
             return
         
-        # Load each block
-        loaded_count = 0
-        missing_count = 0
+        expected_size = torch.tensor(block_shape).prod().item() * kv_cache.element_size()
         
-        if layer_idx == 0:  # 只在layer=0时输出调试信息
-            print(f"\n🔄 [LOAD] Request {request_id} Layer {layer_idx}: Loading {len(block_id_hash_list)} blocks")
+        # Performance counters
+        total_loaded = 0
+        total_missing = 0
+        total_decode_time = 0.0
+        total_gpu_copy_time = 0.0
+        valid_blocks_total = 0
         
-        for block_id, block_hash_str in block_id_hash_list:
-            # Validate block_id is within KV cache bounds
-            if block_id >= num_blocks_dim:
+        # Log start only for layer 0
+        if layer_idx == 0:
+            self.logger.info(f"[LOAD] Request {request_id} Layer {layer_idx}: Loading {len(block_id_hash_list)} blocks "
+                           f"in batches of {self.mget_batch_size}")
+        
+        # Process blocks in batches using MGET
+        for batch_start in range(0, len(block_id_hash_list), self.mget_batch_size):
+            batch_end = min(batch_start + self.mget_batch_size, len(block_id_hash_list))
+            batch = block_id_hash_list[batch_start:batch_end]
+            
+            # Build all keys for this batch
+            k_keys = []
+            v_keys = []
+            valid_blocks = []
+            
+            for block_id, block_hash_str in batch:
+                if block_id >= num_blocks_dim:
+                    continue
+                    
+                k_key = self._build_block_key(layer_idx, block_hash_str, 0)
+                v_key = self._build_block_key(layer_idx, block_hash_str, 1)
+                k_keys.append(k_key)
+                v_keys.append(v_key)
+                valid_blocks.append((block_id, block_hash_str))
+            
+            if not valid_blocks:
                 continue
+            valid_blocks_total += len(valid_blocks)
             
-            # Build PikiwiDB keys using content hash
-            k_key = self._build_block_key(layer_idx, block_hash_str, 0)  # K
-            v_key = self._build_block_key(layer_idx, block_hash_str, 1)  # V
-            
+            # MGET batch timing
+            mget_start = time.time()
             try:
-                k_data = redis_client.get(k_key)
-                v_data = redis_client.get(v_key)
+                # Use pipeline for better performance
+                pipe = redis_client.pipeline()
+                pipe.mget(k_keys)
+                pipe.mget(v_keys)
+                results = pipe.execute()
+                k_results = results[0] if results else []
+                v_results = results[1] if len(results) > 1 else []
                 
-                if k_data is not None and v_data is not None:
-                    # Validate data size
-                    expected_size = torch.tensor(block_shape).prod().item() * kv_cache.element_size()
-                    if len(k_data) != expected_size or len(v_data) != expected_size:
+                mget_time = time.time() - mget_start
+                
+                if layer_idx == 0:
+                    avg_per_key = mget_time / (len(k_keys) * 2) * 1000 if k_keys else 0
+                    self.logger.debug(f"[LOAD] Batch {batch_start//self.mget_batch_size + 1}: "
+                                    f"MGET {len(k_keys)*2} keys in {mget_time*1000:.2f}ms "
+                                    f"({avg_per_key:.3f}ms/key)")
+                
+                # Process batch results
+                decode_start = time.time()
+                batch_loaded = 0
+                batch_missing = 0
+                
+                for i, (block_id, block_hash_str) in enumerate(valid_blocks):
+                    if i >= len(k_results) or i >= len(v_results):
+                        batch_missing += 1
                         continue
+                        
+                    k_data = k_results[i]
+                    v_data = v_results[i]
                     
-                    # Load data into tensors
-                    k_tensor = torch.frombuffer(k_data, dtype=kv_cache.dtype).reshape(block_shape)
-                    v_tensor = torch.frombuffer(v_data, dtype=kv_cache.dtype).reshape(block_shape)
-                    
-                    # Copy to KV cache based on layout
-                    if layout_type == "standard_5d":
-                        kv_cache[0, block_id] = k_tensor  # K: [block_size, num_heads, head_dim]
-                        kv_cache[1, block_id] = v_tensor  # V: [block_size, num_heads, head_dim]
-                    elif layout_type == "legacy_4d":
-                        kv_cache[0, block_id] = k_tensor  # K: [num_heads, head_dim]
-                        kv_cache[1, block_id] = v_tensor  # V: [num_heads, head_dim]
-                    
-                    loaded_count += 1
-                    if layer_idx == 0:
-                        print(f"  ✅ LOADED block_id={block_id}, hash={block_hash_str[:16]}..., keys={k_key}, {v_key}")
-                else:
-                    missing_count += 1
-                    if layer_idx == 0:
-                        k_exists = k_data is not None
-                        v_exists = v_data is not None
-                        print(f"  ❌ MISSING block_id={block_id}, hash={block_hash_str[:16]}..., keys={k_key}, {v_key}")
-                    
+                    if k_data is not None and v_data is not None:
+                        # Validate data size
+                        if len(k_data) != expected_size or len(v_data) != expected_size:
+                            batch_missing += 1
+                            if layer_idx == 0:
+                                self.logger.warning(f"[LOAD] Size mismatch for block {block_id}: "
+                                                  f"expected {expected_size}, got K={len(k_data)}, V={len(v_data)}")
+                            continue
+                        
+                        # Decode tensors (clone to avoid read-only buffer warning)
+                        k_tensor = torch.frombuffer(k_data, dtype=kv_cache.dtype).reshape(block_shape).clone()
+                        v_tensor = torch.frombuffer(v_data, dtype=kv_cache.dtype).reshape(block_shape).clone()
+                        
+                        # GPU copy timing
+                        gpu_copy_start = time.time()
+                        if layout_type == "standard_5d":
+                            kv_cache[0, block_id].copy_(k_tensor)
+                            kv_cache[1, block_id].copy_(v_tensor)
+                        elif layout_type == "legacy_4d":
+                            kv_cache[0, block_id].copy_(k_tensor)
+                            kv_cache[1, block_id].copy_(v_tensor)
+                        gpu_copy_time = time.time() - gpu_copy_start
+                        
+                        batch_loaded += 1
+                        total_gpu_copy_time += gpu_copy_time
+                        
+                        if layer_idx == 0:
+                            self.logger.debug(f"[LOAD] ✅ block_id={block_id}, hash={block_hash_str[:16]}...")
+                    else:
+                        batch_missing += 1
+                        if layer_idx == 0:
+                            self.logger.warning(f"[LOAD] MISS block_id={block_id} hash={block_hash_str}")
+                
+                decode_time = time.time() - decode_start
+                total_decode_time += decode_time
+                total_loaded += batch_loaded
+                total_missing += batch_missing
+                
+                if layer_idx == 0:
+                    avg_decode = decode_time / len(valid_blocks) * 1000 if valid_blocks else 0
+                    avg_gpu_copy = (gpu_copy_time / batch_loaded * 1000) if batch_loaded > 0 else 0
+                    self.logger.debug(f"[LOAD] Batch decode: {decode_time*1000:.2f}ms total "
+                                    f"({avg_decode:.3f}ms/block), GPU copy: {avg_gpu_copy:.3f}ms/block")
+                
             except Exception as e:
                 if layer_idx == 0:
-                    print(f"  ⚠️ ERROR loading block_id={block_id}, hash={block_hash_str[:16]}...: {e}")
+                    self.logger.error(f"[LOAD] Batch {batch_start//self.mget_batch_size + 1} failed: {e}")
+                total_missing += len(valid_blocks)
         
+        # Log summary（仅 layer 0 打汇总，减少噪音）
         if layer_idx == 0:
-            print(f"📊 [LOAD] Layer {layer_idx}: Loaded {loaded_count}/{len(block_id_hash_list)} blocks, {missing_count} missing")
+            total_time = total_decode_time + total_gpu_copy_time
+            avg_decode_per_block = (total_decode_time / total_loaded * 1000) if total_loaded > 0 else 0
+            avg_gpu_copy_per_block = (total_gpu_copy_time / total_loaded * 1000) if total_loaded > 0 else 0
+            
+            self.logger.info(f"[LOAD] Layer {layer_idx} Summary: {total_loaded}/{valid_blocks_total} loaded, "
+                           f"{total_missing} missing. Decode: {avg_decode_per_block:.3f}ms/block, "
+                           f"GPU copy: {avg_gpu_copy_per_block:.3f}ms/block, Total: {total_time*1000:.2f}ms")
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """No-op for blocking implementation."""
@@ -272,81 +369,114 @@ class PikaConnector(KVConnectorBase_V1):
         else:
             return
         
-        # Save each block
+        # Performance counters
         saved_count = 0
         error_count = 0
+        total_encode_time = 0.0
+        total_mset_time = 0.0
         
-        if layer_idx == 0:  # 只在layer=0时输出调试信息
-            print(f"\n💾 [SAVE] Request {request_id} Layer {layer_idx}: Saving {len(block_id_hash_list)} blocks")
+        if layer_idx == 0:  # 只在 layer=0 打印 save 入口
+            self.logger.info(f"[SAVE] Request {request_id} Layer {layer_idx}: Saving {len(block_id_hash_list)} blocks, "
+                           f"batch={self.mget_batch_size}")
         
-        for placeholder_block_id, block_hash_str in block_id_hash_list:
-            # NOTE: For saving, we don't use the placeholder_block_id to index into kv_layer
-            # Instead, we need to find the actual physical block that contains this hash's content
-            # For now, we'll use the placeholder_block_id (which is the logical block index)
-            # as the physical block index. This assumes a direct mapping.
-            physical_block_id = placeholder_block_id
+        # Process blocks in batches using pipeline MSET
+        for batch_start in range(0, len(block_id_hash_list), self.mget_batch_size):
+            batch_end = min(batch_start + self.mget_batch_size, len(block_id_hash_list))
+            batch = block_id_hash_list[batch_start:batch_end]
             
-            # Validate physical_block_id is within KV cache bounds
-            if physical_block_id >= num_blocks_dim:
-                error_count += 1
+            # Prepare batch data
+            batch_kv_pairs = {}
+            valid_blocks = []
+            
+            encode_start = time.time()
+            for placeholder_block_id, block_hash_str in batch:
+                # Use placeholder as physical block ID (direct mapping assumption)
+                physical_block_id = placeholder_block_id
+                
+                # Validate physical_block_id is within KV cache bounds
+                if physical_block_id >= num_blocks_dim:
+                    error_count += 1
+                    continue
+                
+                try:
+                    # Extract K and V data based on layout
+                    if layout_type == "standard_5d":  # [2, num_blocks, block_size, num_heads, head_dim]
+                        k_tensor = kv_layer[0, physical_block_id]  # [block_size, num_heads, head_dim]
+                        v_tensor = kv_layer[1, physical_block_id]  # [block_size, num_heads, head_dim]
+                    elif layout_type == "legacy_4d":  # [2, num_blocks, num_heads, head_dim]
+                        k_tensor = kv_layer[0, physical_block_id]  # [num_heads, head_dim]
+                        v_tensor = kv_layer[1, physical_block_id]  # [num_heads, head_dim]
+                    
+                    # Convert to bytes for storage
+                    k_data = k_tensor.contiguous().cpu().numpy().tobytes()
+                    v_data = v_tensor.contiguous().cpu().numpy().tobytes()
+                    
+                    # Build PikiwiDB keys using content hash
+                    k_key = self._build_block_key(layer_idx, block_hash_str, 0)
+                    v_key = self._build_block_key(layer_idx, block_hash_str, 1)
+                    
+                    batch_kv_pairs[k_key] = k_data
+                    batch_kv_pairs[v_key] = v_data
+                    valid_blocks.append((physical_block_id, block_hash_str))
+                    
+                except Exception as e:
+                    error_count += 1
+                    if layer_idx == 0:
+                        self.logger.error(f"[SAVE] Error encoding block {physical_block_id}: {e}")
+            
+            encode_time = time.time() - encode_start
+            total_encode_time += encode_time
+            
+            if not batch_kv_pairs:
                 continue
             
+            # Batch save using MSET
+            mset_start = time.time()
             try:
-                # Extract K and V data based on layout
-                if layout_type == "standard_5d":  # [2, num_blocks, block_size, num_heads, head_dim]
-                    k_tensor = kv_layer[0, physical_block_id]  # [block_size, num_heads, head_dim]
-                    v_tensor = kv_layer[1, physical_block_id]  # [block_size, num_heads, head_dim]
-                elif layout_type == "legacy_4d":  # [2, num_blocks, num_heads, head_dim]
-                    k_tensor = kv_layer[0, physical_block_id]  # [num_heads, head_dim]
-                    v_tensor = kv_layer[1, physical_block_id]  # [num_heads, head_dim]
+                redis_client.mset(batch_kv_pairs)
+                mset_time = time.time() - mset_start
+                total_mset_time += mset_time
                 
-                # Convert to bytes for storage
-                k_data = k_tensor.contiguous().cpu().numpy().tobytes()
-                v_data = v_tensor.contiguous().cpu().numpy().tobytes()
+                batch_saved = len(valid_blocks)
+                saved_count += batch_saved
                 
-                # Build PikiwiDB keys using content hash
-                k_key = self._build_block_key(layer_idx, block_hash_str, 0)
-                v_key = self._build_block_key(layer_idx, block_hash_str, 1)
-                
-                # Save to PikiwiDB
-                redis_client.set(k_key, k_data)
-                redis_client.set(v_key, v_data)
-                
-                saved_count += 1
                 if layer_idx == 0:
-                    print(f"  💾 SAVED physical_block_id={physical_block_id}, hash={block_hash_str[:16]}..., keys={k_key}, {v_key}")
+                    avg_encode = encode_time / len(batch) * 1000 if batch else 0
+                    avg_mset = mset_time / len(batch_kv_pairs) * 1000 if batch_kv_pairs else 0
+                    self.logger.debug(
+                        f"[SAVE] Batch {batch_start//self.mget_batch_size + 1}: "
+                        f"encode={encode_time*1000:.2f}ms({avg_encode:.3f}ms/block), "
+                        f"mset={mset_time*1000:.2f}ms({avg_mset:.3f}ms/key), blocks={len(valid_blocks)}"
+                    )
                 
             except Exception as e:
-                error_count += 1
                 if layer_idx == 0:
-                    print(f"  ⚠️ ERROR saving physical_block_id={physical_block_id}, hash={block_hash_str[:16]}...: {e}")
+                    self.logger.error(f"[SAVE] Batch {batch_start//self.mget_batch_size + 1} MSET failed: {e}")
+                error_count += len(valid_blocks)
         
+        # Log summary for layer 0
         if layer_idx == 0:
-            print(f"📊 [SAVE] Layer {layer_idx}: Saved {saved_count}/{len(block_id_hash_list)} blocks, {error_count} errors")
+            total_time = total_encode_time + total_mset_time
+            avg_encode_per_block = (total_encode_time / saved_count * 1000) if saved_count > 0 else 0
+            avg_mset_per_key = (total_mset_time / (saved_count * 2) * 1000) if saved_count > 0 else 0  # *2 for K+V
+            self.logger.info(
+                f"[SAVE] Layer {layer_idx} Summary: {saved_count}/{len(block_id_hash_list)} saved, "
+                f"{error_count} errors. encode={avg_encode_per_block:.3f}ms/block, "
+                f"mset={avg_mset_per_key:.3f}ms/key, total={total_time*1000:.2f}ms"
+            )
 
     def wait_for_save(self):
         """No-op for blocking implementation."""
         pass
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        # finished_sending: 本轮所有“发送到外部存储”的请求（这里我们同步保存，返回 None）
+        # finished_recving: 外部存储“接收完成/从外部加载完成”的请求（我们用上面的集合）
+        if self._finished_recving:
+            done = set(self._finished_recving)
+            self._finished_recving.clear()
+            return None, done
         return None, None
-        
-        """
-        Report which requests have finished async operations.
-        For blocking implementation, all operations complete immediately.
-        """
-
-        """
-        # In our blocking implementation, any finished request has completed saving
-        # Return the finished requests as "sending done" so blocks can be freed
-        finished_sending = finished_req_ids if finished_req_ids else None
-        finished_recving = None  # We don't track async receiving in this implementation
-        
-        if finished_sending:
-            logger.debug(f"Reporting {len(finished_sending)} requests as finished sending")
-        
-        return finished_sending, finished_recving
-        """
 
     # ==============================
     # Scheduler-side methods
@@ -355,19 +485,23 @@ class PikaConnector(KVConnectorBase_V1):
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         """Cache hit detection: check for consecutive prefix blocks using vLLM-native block hashes."""
         # Strict validation of block_hashes
-        if not hasattr(request, 'block_hashes') or not request.block_hashes or not isinstance(request.block_hashes, list):
+        if not hasattr(request, 'block_hashes') or not isinstance(request.block_hashes, list) or not request.block_hashes:
+            return 0, False
+        
+        total_full_blocks = request.num_tokens // self.block_size  # 只看完整块
+        if total_full_blocks == 0:
             return 0, False
         
         # Calculate starting block index based on computed tokens
-        start_block_idx = num_computed_tokens // self.block_size
-        if start_block_idx >= len(request.block_hashes):
+        start_block_idx = min(num_computed_tokens // self.block_size, total_full_blocks)
+        if start_block_idx >= total_full_blocks:
             return 0, False
         
         # Check consecutive blocks starting from start_block_idx
         redis_client = self._get_redis_client()
         hit_blocks = 0
         
-        for block_idx in range(start_block_idx, len(request.block_hashes)):
+        for block_idx in range(start_block_idx, total_full_blocks): # 只到完整块的末尾
             block_hash_obj = request.block_hashes[block_idx]
             
             # Validate block hash object (vLLM BlockHash)
@@ -394,6 +528,8 @@ class PikaConnector(KVConnectorBase_V1):
         
         if hit_blocks > 0:
             hit_tokens = hit_blocks * self.block_size
+            self.logger.info(f"[HIT] Request {request.request_id}: Found {hit_blocks} consecutive cached blocks "
+                           f"({hit_tokens} tokens) starting from block {start_block_idx}")
             return hit_tokens, True
         
         return 0, False
@@ -430,32 +566,32 @@ class PikaConnector(KVConnectorBase_V1):
         # Calculate the range of logical blocks that need to be handled
         # These are blocks that contain tokens from num_computed_tokens onwards
         start_logical_block = num_computed_tokens // self.block_size
-        end_logical_block = (num_total_tokens + self.block_size - 1) // self.block_size  # Ceiling division
+        end_logical_block_full = min(len(request.block_hashes), num_total_tokens // self.block_size)  # 只到完整块
+        if start_logical_block >= end_logical_block_full:
+            return
         
         # Build mapping of physical block_id to logical block hash
         # IMPORTANT: The physical blocks are allocated in sequence for the token range
         # that needs computation, starting from the first uncomputed token
+        # 仅映射本轮需要的、且有对应物理块的那一段
+        num_to_map = min(end_logical_block_full - start_logical_block, len(block_ids))
+        if num_to_map <= 0:
+            return
+
         block_id_hash_pairs = []
-        
-        physical_block_idx = 0
-        for logical_block_idx in range(start_logical_block, end_logical_block):
-            if physical_block_idx >= len(block_ids):
-                break
-                
-            if logical_block_idx >= len(request.block_hashes):
-                physical_block_idx += 1
+        for i in range(num_to_map):
+            logical_idx = start_logical_block + i
+            bh = request.block_hashes[logical_idx]
+            if not bh or not hasattr(bh, 'hash_value'):
                 continue
-            
-            block_hash_obj = request.block_hashes[logical_block_idx]
-            if not block_hash_obj or not hasattr(block_hash_obj, 'hash_value'):
-                physical_block_idx += 1
-                continue
-            
-            physical_block_id = block_ids[physical_block_idx]
-            block_hash_str = str(block_hash_obj.hash_value)
-            
-            block_id_hash_pairs.append((physical_block_id, block_hash_str))
-            physical_block_idx += 1
+            physical_block_id = block_ids[i]
+            block_id_hash_pairs.append((physical_block_id, str(bh.hash_value)))
+
+        # 生成完 block_id_hash_pairs 之后，且在写 _blocks_to_load 之前，新增：
+        save_map = self._save_map_by_req.setdefault(request.request_id, {})
+        for physical_block_id, block_hash_str in block_id_hash_pairs:
+            # 记录“这个hash目前对应哪个物理块槽位”（后写覆盖先写，保持最新）
+            save_map[block_hash_str] = physical_block_id
         
         if not block_id_hash_pairs:
             return
@@ -484,58 +620,42 @@ class PikaConnector(KVConnectorBase_V1):
         return metadata
 
     def request_finished(self, request: "Request", block_ids: list[int]) -> tuple[bool, Optional[dict[str, Any]]]:
-        """
-        When a request finishes, save its blocks to PikiwiDB using vLLM-native block hashes.
-        
-        CRITICAL: We need to correctly map the physical block_ids to their corresponding
-        logical block_hashes for saving. This is the reverse of the allocation mapping.
-        """
-        if not block_ids:
+        # 同步实现：返回 False 允许上层立即释放；我们自己调度保存
+        if not hasattr(request, 'block_hashes') or not isinstance(request.block_hashes, list) or not request.block_hashes:
             return False, None
-        
-        # Strict validation of block_hashes
-        if not hasattr(request, 'block_hashes') or not request.block_hashes or not isinstance(request.block_hashes, list):
+
+        full_blocks = request.num_tokens // self.block_size
+        if full_blocks <= 0:
             return False, None
-        
-        # Calculate which logical blocks have complete hashes and should be saved
-        # Only save blocks that correspond to complete token sequences
-        num_total_tokens = request.num_tokens
-        num_complete_blocks = num_total_tokens // self.block_size
-        
-        # Build mapping of physical block_id to logical block hash for saving
-        block_id_hash_pairs = []
-        
-        # For saving, we want to save all complete blocks that have valid hashes
-        for logical_block_idx in range(min(num_complete_blocks, len(request.block_hashes))):
-            block_hash_obj = request.block_hashes[logical_block_idx]
-            
-            if not block_hash_obj or not hasattr(block_hash_obj, 'hash_value'):
+
+        # 取出在分配阶段积累的“hash -> 物理块id”映射
+        save_map = self._save_map_by_req.pop(request.request_id, {})
+        if not save_map:
+            # 没拿到映射说明这轮没分配/没计算到完整块，直接返回
+            return False, None
+
+        # 仅保存“完整块”对应的hash；并按映射找到物理块id
+        pairs: list[tuple[int, str]] = []
+        miss_cnt = 0
+        for i in range(min(full_blocks, len(request.block_hashes))):
+            bh = request.block_hashes[i]
+            if not bh or not hasattr(bh, 'hash_value'):
                 continue
-            
-            # For complete blocks, we'll use a placeholder physical block ID
-            # The actual mapping will be handled during saving based on the hash
-            block_hash_str = str(block_hash_obj.hash_value)
-            
-            # Use logical block index as placeholder physical block ID for now
-            # The save operation will use the hash to identify the content, not the physical ID
-            placeholder_block_id = logical_block_idx
-            
-            block_id_hash_pairs.append((placeholder_block_id, block_hash_str))
-        
-        if not block_id_hash_pairs:
+            h = str(bh.hash_value)
+            pid = save_map.get(h)
+            if pid is not None:
+                pairs.append((pid, h))
+            else:
+                miss_cnt += 1
+                # 可选：打点方便你排查
+                self.logger.debug(f"[SAVE] No physical slot recorded for hash={h[:16]}..., req={request.request_id}")
+
+        if not pairs:
             return False, None
-        
-        # Schedule blocks for saving across all layers
+
+        # 跨所有层安排保存任务（这里 pairs 的第一个元素是“真实物理块 id”）
         num_layers = self.model_config.get_num_layers(self.parallel_config)
-        layer_block_list = []
-        
-        for layer_idx in range(num_layers):
-            layer_block_list.append((layer_idx, block_id_hash_pairs.copy()))
-        
-        self._blocks_to_save[request.request_id] = layer_block_list
-        
-        # Return False to allow immediate block freeing since we're using content-based saving
-        # The hash-based approach doesn't depend on specific physical block IDs
+        self._blocks_to_save[request.request_id] = [(layer_idx, pairs.copy()) for layer_idx in range(num_layers)]
         return False, None
 
     @classmethod
