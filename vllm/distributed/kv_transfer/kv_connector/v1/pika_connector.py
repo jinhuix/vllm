@@ -11,6 +11,7 @@ This is a basic implementation that supports:
 """
 
 import hashlib
+import os
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -85,6 +86,12 @@ class PikaConnector(KVConnectorBase_V1):
         self._pending_load_layers: dict[str, int] = {}  # request_id -> 剩余待加载层数
         self._finished_recving: set[str] = set()        # 已完成加载的 request_id
         self._save_map_by_req: dict[str, dict[str, int]] = {}  # request_id -> {hash: physical_block_id}
+        
+        # GPU-first optimization: maintain GPU resident index per layer
+        # gpu_hash2pid[layer_idx][block_hash] = physical_block_id
+        self._gpu_hash2pid: dict[int, dict[str, int]] = {}
+        # gpu_pid2hash[layer_idx][physical_block_id] = block_hash  
+        self._gpu_pid2hash: dict[int, dict[int, str]] = {}
 
         # Scheduler-side: track blocks to load/save
         if role == KVConnectorRole.SCHEDULER:
@@ -125,6 +132,33 @@ class PikaConnector(KVConnectorBase_V1):
     def _build_block_key(self, layer_idx: int, block_hash: str, k_type: int) -> str:
         """Build PikiwiDB key for a KV block using content hash."""
         return f"kvblock:{self.namespace}:{layer_idx}:{block_hash}:{k_type}"
+    
+    def _gpu_lookup(self, layer_idx: int, block_hash: str) -> Optional[int]:
+        """Lookup physical block ID in GPU cache for given layer and block hash."""
+        layer_map = self._gpu_hash2pid.get(layer_idx, {})
+        return layer_map.get(block_hash)
+    
+    def _gpu_map(self, layer_idx: int, physical_block_id: int, block_hash: str) -> None:
+        """Update GPU index when a block is loaded/written to physical slot."""
+        # Initialize layer maps if needed
+        if layer_idx not in self._gpu_hash2pid:
+            self._gpu_hash2pid[layer_idx] = {}
+        if layer_idx not in self._gpu_pid2hash:
+            self._gpu_pid2hash[layer_idx] = {}
+        
+        # Clear old mappings for this physical slot (eviction/overwrite)
+        old_hash = self._gpu_pid2hash[layer_idx].get(physical_block_id)
+        if old_hash is not None:
+            self._gpu_hash2pid[layer_idx].pop(old_hash, None)
+        
+        # Clear old mappings for this hash (if mapped to different slot)
+        old_pid = self._gpu_hash2pid[layer_idx].get(block_hash)
+        if old_pid is not None and old_pid != physical_block_id:
+            self._gpu_pid2hash[layer_idx].pop(old_pid, None)
+        
+        # Set new mappings
+        self._gpu_hash2pid[layer_idx][block_hash] = physical_block_id
+        self._gpu_pid2hash[layer_idx][physical_block_id] = block_hash
 
     # ==============================
     # Worker-side methods
@@ -175,7 +209,7 @@ class PikaConnector(KVConnectorBase_V1):
 
     def _load_blocks_for_layer(self, redis_client: redis.Redis, layer_idx: int, 
                               block_id_hash_list: list[tuple[int, str]], kv_cache: torch.Tensor, request_id: str):
-        """Load blocks for a specific layer using MGET batching for better performance."""
+        """Load blocks for a specific layer using GPU-first optimization and MGET batching."""
         kv_shape = kv_cache.shape
         
         # Validate KV cache shape and determine layout
@@ -190,134 +224,175 @@ class PikaConnector(KVConnectorBase_V1):
         else:
             return
         
-        expected_size = torch.tensor(block_shape).prod().item() * kv_cache.element_size()
+        # Calculate expected size (BFloat16 data is stored as Float32)
+        element_size = 4 if kv_cache.dtype == torch.bfloat16 else kv_cache.element_size()  # Float32 = 4 bytes
+        expected_size = torch.tensor(block_shape).prod().item() * element_size
         
-        # Performance counters
-        total_loaded = 0
-        total_missing = 0
-        total_decode_time = 0.0
+        # Performance counters for GPU-first optimization
+        gpu_hits = 0
+        db_loaded = 0
+        db_miss = 0
         total_gpu_copy_time = 0.0
+        total_decode_time = 0.0
         valid_blocks_total = 0
         
         # Log start only for layer 0
         if layer_idx == 0:
-            self.logger.info(f"[LOAD] Request {request_id} Layer {layer_idx}: Loading {len(block_id_hash_list)} blocks "
-                           f"in batches of {self.mget_batch_size}")
+            dev = getattr(kv_cache.device, "index", None)
+            self.logger.info(
+                f"[LOAD] Request {request_id} Layer {layer_idx} (pid={os.getpid()}, dev={dev}): "
+                f"Loading {len(block_id_hash_list)} blocks (GPU-first)"
+            )
         
-        # Process blocks in batches using MGET
+        # Process blocks in batches using GPU-first strategy
         for batch_start in range(0, len(block_id_hash_list), self.mget_batch_size):
             batch_end = min(batch_start + self.mget_batch_size, len(block_id_hash_list))
             batch = block_id_hash_list[batch_start:batch_end]
             
-            # Build all keys for this batch
-            k_keys = []
-            v_keys = []
-            valid_blocks = []
+            # Phase 1: GPU-first lookup and device-to-device copy
+            db_candidates = []  # Blocks that need DB lookup
+            gpu_copy_start = time.time()
             
-            for block_id, block_hash_str in batch:
-                if block_id >= num_blocks_dim:
+            for target_block_id, block_hash_str in batch:
+                if target_block_id >= num_blocks_dim:
                     continue
-                    
-                k_key = self._build_block_key(layer_idx, block_hash_str, 0)
-                v_key = self._build_block_key(layer_idx, block_hash_str, 1)
-                k_keys.append(k_key)
-                v_keys.append(v_key)
-                valid_blocks.append((block_id, block_hash_str))
-            
-            if not valid_blocks:
-                continue
-            valid_blocks_total += len(valid_blocks)
-            
-            # MGET batch timing
-            mget_start = time.time()
-            try:
-                # Use pipeline for better performance
-                pipe = redis_client.pipeline()
-                pipe.mget(k_keys)
-                pipe.mget(v_keys)
-                results = pipe.execute()
-                k_results = results[0] if results else []
-                v_results = results[1] if len(results) > 1 else []
+                valid_blocks_total += 1
                 
-                mget_time = time.time() - mget_start
-                
-                if layer_idx == 0:
-                    avg_per_key = mget_time / (len(k_keys) * 2) * 1000 if k_keys else 0
-                    self.logger.debug(f"[LOAD] Batch {batch_start//self.mget_batch_size + 1}: "
-                                    f"MGET {len(k_keys)*2} keys in {mget_time*1000:.2f}ms "
-                                    f"({avg_per_key:.3f}ms/key)")
-                
-                # Process batch results
-                decode_start = time.time()
-                batch_loaded = 0
-                batch_missing = 0
-                
-                for i, (block_id, block_hash_str) in enumerate(valid_blocks):
-                    if i >= len(k_results) or i >= len(v_results):
-                        batch_missing += 1
+                # Try GPU lookup first
+                src_block_id = self._gpu_lookup(layer_idx, block_hash_str)
+                if src_block_id is not None:
+                    # GPU hit: perform device-to-device copy
+                    try:
+                        if src_block_id != target_block_id:
+                            if layout_type == "standard_5d":
+                                kv_cache[0, target_block_id].copy_(kv_cache[0, src_block_id])  # K copy
+                                kv_cache[1, target_block_id].copy_(kv_cache[1, src_block_id])  # V copy
+                            elif layout_type == "legacy_4d":
+                                kv_cache[0, target_block_id].copy_(kv_cache[0, src_block_id])  # K copy
+                                kv_cache[1, target_block_id].copy_(kv_cache[1, src_block_id])  # V copy
+                        
+                        # Update GPU index for the new slot
+                        self._gpu_map(layer_idx, target_block_id, block_hash_str)
+                        gpu_hits += 1
+
+                        if layer_idx == 0:
+                            self.logger.debug(f"[LOAD] GPU-HIT block_id={target_block_id}, hash={block_hash_str[:16]}... "
+                                            f"(copied from slot {src_block_id})")
+                        # GPU 命中已处理完，进入下一项
                         continue
-                        
-                    k_data = k_results[i]
-                    v_data = v_results[i]
-                    
-                    if k_data is not None and v_data is not None:
-                        # Validate data size
-                        if len(k_data) != expected_size or len(v_data) != expected_size:
-                            batch_missing += 1
-                            if layer_idx == 0:
-                                self.logger.warning(f"[LOAD] Size mismatch for block {block_id}: "
-                                                  f"expected {expected_size}, got K={len(k_data)}, V={len(v_data)}")
-                            continue
-                        
-                        # Decode tensors (clone to avoid read-only buffer warning)
-                        k_tensor = torch.frombuffer(k_data, dtype=kv_cache.dtype).reshape(block_shape).clone()
-                        v_tensor = torch.frombuffer(v_data, dtype=kv_cache.dtype).reshape(block_shape).clone()
-                        
-                        # GPU copy timing
-                        gpu_copy_start = time.time()
-                        if layout_type == "standard_5d":
-                            kv_cache[0, block_id].copy_(k_tensor)
-                            kv_cache[1, block_id].copy_(v_tensor)
-                        elif layout_type == "legacy_4d":
-                            kv_cache[0, block_id].copy_(k_tensor)
-                            kv_cache[1, block_id].copy_(v_tensor)
-                        gpu_copy_time = time.time() - gpu_copy_start
-                        
-                        batch_loaded += 1
-                        total_gpu_copy_time += gpu_copy_time
-                        
+                    except Exception as e:
                         if layer_idx == 0:
-                            self.logger.debug(f"[LOAD] ✅ block_id={block_id}, hash={block_hash_str[:16]}...")
-                    else:
-                        batch_missing += 1
-                        if layer_idx == 0:
-                            self.logger.warning(f"[LOAD] MISS block_id={block_id} hash={block_hash_str}")
-                
-                decode_time = time.time() - decode_start
-                total_decode_time += decode_time
-                total_loaded += batch_loaded
-                total_missing += batch_missing
-                
-                if layer_idx == 0:
-                    avg_decode = decode_time / len(valid_blocks) * 1000 if valid_blocks else 0
-                    avg_gpu_copy = (gpu_copy_time / batch_loaded * 1000) if batch_loaded > 0 else 0
-                    self.logger.debug(f"[LOAD] Batch decode: {decode_time*1000:.2f}ms total "
-                                    f"({avg_decode:.3f}ms/block), GPU copy: {avg_gpu_copy:.3f}ms/block")
-                
-            except Exception as e:
-                if layer_idx == 0:
-                    self.logger.error(f"[LOAD] Batch {batch_start//self.mget_batch_size + 1} failed: {e}")
-                total_missing += len(valid_blocks)
-        
-        # Log summary（仅 layer 0 打汇总，减少噪音）
-        if layer_idx == 0:
-            total_time = total_decode_time + total_gpu_copy_time
-            avg_decode_per_block = (total_decode_time / total_loaded * 1000) if total_loaded > 0 else 0
-            avg_gpu_copy_per_block = (total_gpu_copy_time / total_loaded * 1000) if total_loaded > 0 else 0
+                            self.logger.warning(f"[LOAD] GPU copy failed for block {target_block_id}: {e}")
+                        # Fallback to DB lookup
+                        db_candidates.append((target_block_id, block_hash_str))
+                else:
+                    # GPU miss: add to DB candidates
+                    db_candidates.append((target_block_id, block_hash_str))
             
-            self.logger.info(f"[LOAD] Layer {layer_idx} Summary: {total_loaded}/{valid_blocks_total} loaded, "
-                           f"{total_missing} missing. Decode: {avg_decode_per_block:.3f}ms/block, "
-                           f"GPU copy: {avg_gpu_copy_per_block:.3f}ms/block, Total: {total_time*1000:.2f}ms")
+            gpu_copy_time = time.time() - gpu_copy_start
+            total_gpu_copy_time += gpu_copy_time
+            
+            # Phase 2: DB lookup for remaining candidates
+            if db_candidates:
+                k_keys = []
+                v_keys = []
+                
+                for block_id, block_hash_str in db_candidates:
+                    k_key = self._build_block_key(layer_idx, block_hash_str, 0)
+                    v_key = self._build_block_key(layer_idx, block_hash_str, 1)
+                    k_keys.append(k_key)
+                    v_keys.append(v_key)
+                
+                # MGET batch timing
+                mget_start = time.time()
+                try:
+                    # Use pipeline for better performance
+                    pipe = redis_client.pipeline()
+                    pipe.mget(k_keys)
+                    pipe.mget(v_keys)
+                    results = pipe.execute()
+                    k_results = results[0] if results else []
+                    v_results = results[1] if len(results) > 1 else []
+                    
+                    mget_time = time.time() - mget_start
+                    
+                    if layer_idx == 0:
+                        avg_per_key = mget_time / (len(k_keys) * 2) * 1000 if k_keys else 0
+                        self.logger.debug(f"[LOAD] DB-MGET {len(k_keys)*2} keys in {mget_time*1000:.2f}ms "
+                                        f"({avg_per_key:.3f}ms/key)")
+                    
+                    # Process DB results
+                    decode_start = time.time()
+                    
+                    for i, (block_id, block_hash_str) in enumerate(db_candidates):
+                        if i >= len(k_results) or i >= len(v_results):
+                            db_miss += 1
+                            continue
+                            
+                        k_data = k_results[i]
+                        v_data = v_results[i]
+                        
+                        if k_data is not None and v_data is not None:
+                            # Validate data size
+                            if len(k_data) != expected_size or len(v_data) != expected_size:
+                                db_miss += 1
+                                if layer_idx == 0:
+                                    self.logger.warning(f"[LOAD] Size mismatch for block {block_id}: "
+                                                      f"expected {expected_size}, got K={len(k_data)}, V={len(v_data)}")
+                                continue
+                            
+                            # Decode tensors (handle BFloat16 by loading as float32 then converting back)
+                            if kv_cache.dtype == torch.bfloat16:
+                                # Data was saved as float32, load and convert back to bfloat16
+                                k_tensor = torch.frombuffer(k_data, dtype=torch.float32).reshape(block_shape).to(torch.bfloat16).clone()
+                                v_tensor = torch.frombuffer(v_data, dtype=torch.float32).reshape(block_shape).to(torch.bfloat16).clone()
+                            else:
+                                # Direct loading for other dtypes
+                                k_tensor = torch.frombuffer(k_data, dtype=kv_cache.dtype).reshape(block_shape).clone()
+                                v_tensor = torch.frombuffer(v_data, dtype=kv_cache.dtype).reshape(block_shape).clone()
+                            
+                            # GPU copy timing
+                            gpu_copy_start_inner = time.time()
+                            if layout_type == "standard_5d":
+                                kv_cache[0, block_id].copy_(k_tensor)
+                                kv_cache[1, block_id].copy_(v_tensor)
+                            elif layout_type == "legacy_4d":
+                                kv_cache[0, block_id].copy_(k_tensor)
+                                kv_cache[1, block_id].copy_(v_tensor)
+                            gpu_copy_time_inner = time.time() - gpu_copy_start_inner
+                            total_gpu_copy_time += gpu_copy_time_inner
+                            
+                            # Update GPU index after successful DB load
+                            self._gpu_map(layer_idx, block_id, block_hash_str)
+                            db_loaded += 1
+                            
+                            if layer_idx == 0:
+                                self.logger.debug(f"[LOAD] DB-LOADED block_id={block_id}, hash={block_hash_str[:16]}...")
+                        else:
+                            db_miss += 1
+                            if layer_idx == 0:
+                                self.logger.warning(f"[LOAD] DB-MISS block_id={block_id} hash={block_hash_str}")
+                    
+                    decode_time = time.time() - decode_start
+                    total_decode_time += decode_time
+                    
+                except Exception as e:
+                    if layer_idx == 0:
+                        self.logger.error(f"[LOAD] DB batch failed: {e}")
+                    db_miss += len(db_candidates)
+        
+        # Log summary with GPU-first metrics (only for layer 0)
+        if layer_idx == 0:
+            total_blocks = valid_blocks_total
+            total_time = total_gpu_copy_time + total_decode_time
+            avg_gpu_copy_per_block = (total_gpu_copy_time / total_blocks * 1000) if total_blocks > 0 else 0
+            avg_decode_per_block = (total_decode_time / db_loaded * 1000) if db_loaded > 0 else 0
+            gpu_hit_rate = gpu_hits / total_blocks if total_blocks > 0 else 0.0
+            
+            self.logger.info(f"[LOAD] Layer {layer_idx} Summary: gpu_hits={gpu_hits}, db_loaded={db_loaded}, "
+                           f"db_miss={db_miss}, gpu_hit_rate={gpu_hit_rate:.1%}. "
+                           f"GPU copy: {avg_gpu_copy_per_block:.3f}ms/block, "
+                           f"DB decode: {avg_decode_per_block:.3f}ms/block, Total: {total_time*1000:.2f}ms")
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """No-op for blocking implementation."""
@@ -407,9 +482,13 @@ class PikaConnector(KVConnectorBase_V1):
                         k_tensor = kv_layer[0, physical_block_id]  # [num_heads, head_dim]
                         v_tensor = kv_layer[1, physical_block_id]  # [num_heads, head_dim]
                     
-                    # Convert to bytes for storage
-                    k_data = k_tensor.contiguous().cpu().numpy().tobytes()
-                    v_data = v_tensor.contiguous().cpu().numpy().tobytes()
+                    # Convert to bytes for storage (handle BFloat16 by converting to float32)
+                    if k_tensor.dtype == torch.bfloat16:
+                        k_data = k_tensor.contiguous().cpu().to(torch.float32).numpy().tobytes()
+                        v_data = v_tensor.contiguous().cpu().to(torch.float32).numpy().tobytes()
+                    else:
+                        k_data = k_tensor.contiguous().cpu().numpy().tobytes()
+                        v_data = v_tensor.contiguous().cpu().numpy().tobytes()
                     
                     # Build PikiwiDB keys using content hash
                     k_key = self._build_block_key(layer_idx, block_hash_str, 0)
@@ -418,6 +497,10 @@ class PikaConnector(KVConnectorBase_V1):
                     batch_kv_pairs[k_key] = k_data
                     batch_kv_pairs[v_key] = v_data
                     valid_blocks.append((physical_block_id, block_hash_str))
+                    
+                    # Update GPU index immediately after encoding (before Redis MSET)
+                    # This allows subsequent loads within the same session to hit GPU cache
+                    self._gpu_map(layer_idx, physical_block_id, block_hash_str)
                     
                 except Exception as e:
                     error_count += 1
@@ -604,6 +687,15 @@ class PikaConnector(KVConnectorBase_V1):
             layer_block_list.append((layer_idx, block_id_hash_pairs.copy()))
         
         self._blocks_to_load[request.request_id] = layer_block_list
+        
+        # Schedule saving for the same blocks (方案 A: 即时安排保存，不等 request_finished)
+        # 对于计算过程中的新块，我们需要在计算完成后立即保存以供后续复用
+        # 这确保了每个调度步骤都能通过 build_connector_meta 下发保存任务到 worker
+        save_layer_block_list = []
+        for layer_idx in range(num_layers):
+            save_layer_block_list.append((layer_idx, block_id_hash_pairs.copy()))
+        
+        self._blocks_to_save[request.request_id] = save_layer_block_list
 
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> PikaConnectorMetadata:
         """Build metadata for this step."""
@@ -620,42 +712,9 @@ class PikaConnector(KVConnectorBase_V1):
         return metadata
 
     def request_finished(self, request: "Request", block_ids: list[int]) -> tuple[bool, Optional[dict[str, Any]]]:
-        # 同步实现：返回 False 允许上层立即释放；我们自己调度保存
-        if not hasattr(request, 'block_hashes') or not isinstance(request.block_hashes, list) or not request.block_hashes:
-            return False, None
-
-        full_blocks = request.num_tokens // self.block_size
-        if full_blocks <= 0:
-            return False, None
-
-        # 取出在分配阶段积累的“hash -> 物理块id”映射
-        save_map = self._save_map_by_req.pop(request.request_id, {})
-        if not save_map:
-            # 没拿到映射说明这轮没分配/没计算到完整块，直接返回
-            return False, None
-
-        # 仅保存“完整块”对应的hash；并按映射找到物理块id
-        pairs: list[tuple[int, str]] = []
-        miss_cnt = 0
-        for i in range(min(full_blocks, len(request.block_hashes))):
-            bh = request.block_hashes[i]
-            if not bh or not hasattr(bh, 'hash_value'):
-                continue
-            h = str(bh.hash_value)
-            pid = save_map.get(h)
-            if pid is not None:
-                pairs.append((pid, h))
-            else:
-                miss_cnt += 1
-                # 可选：打点方便你排查
-                self.logger.debug(f"[SAVE] No physical slot recorded for hash={h[:16]}..., req={request.request_id}")
-
-        if not pairs:
-            return False, None
-
-        # 跨所有层安排保存任务（这里 pairs 的第一个元素是“真实物理块 id”）
-        num_layers = self.model_config.get_num_layers(self.parallel_config)
-        self._blocks_to_save[request.request_id] = [(layer_idx, pairs.copy()) for layer_idx in range(num_layers)]
+        # 简化实现：保存逻辑已在 update_state_after_alloc 中处理
+        # 只需清理映射表，允许上层立即释放
+        self._save_map_by_req.pop(request.request_id, {})
         return False, None
 
     @classmethod
